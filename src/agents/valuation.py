@@ -3,7 +3,7 @@ from graph.state import AgentState, show_agent_reasoning
 from utils.progress import progress
 import json
 
-from tools.api import get_financial_metrics, get_market_cap, search_line_items
+from tools.yfinance_api import get_financial_metrics, get_market_cap, search_line_items
 
 
 ##### Valuation Agent #####
@@ -13,113 +13,204 @@ def valuation_agent(state: AgentState):
     end_date = data["end_date"]
     tickers = data["tickers"]
 
+    print(f"\n=== Valuation Agent Debug ===")
+    print(f"End date: {end_date}")
+    print(f"Tickers: {tickers}")
+
     # Initialize valuation analysis for each ticker
     valuation_analysis = {}
 
     for ticker in tickers:
+        print(f"\nProcessing ticker: {ticker}")
         progress.update_status("valuation_agent", ticker, "Fetching financial data")
 
-        # Fetch the financial metrics
-        financial_metrics = get_financial_metrics(
-            ticker=ticker,
-            end_date=end_date,
-            period="ttm",
-        )
+        try:
+            # Fetch the financial metrics
+            print(f"Fetching financial metrics for {ticker}...")
+            financial_metrics = get_financial_metrics(
+                ticker=ticker,
+                end_date=end_date,
+                period="ttm",
+            )
 
-        # Add safety check for financial metrics
-        if not financial_metrics:
-            progress.update_status("valuation_agent", ticker, "Failed: No financial metrics found")
+            # Add safety check for financial metrics
+            if not financial_metrics:
+                print(f"No financial metrics found for {ticker}")
+                progress.update_status("valuation_agent", ticker, "Failed: No financial metrics found")
+                continue
+            
+            metrics = financial_metrics[0]
+            print(f"Metrics keys available: {metrics.keys()}")
+
+            progress.update_status("valuation_agent", ticker, "Gathering line items")
+            print(f"Searching line items for {ticker}...")
+            # Fetch the specific line_items that we need for valuation purposes
+            financial_line_items = search_line_items(
+                ticker=ticker,
+                line_items=[
+                    "free_cash_flow",
+                    "net_income",
+                    "depreciation_and_amortization",
+                    "capital_expenditure",
+                    "working_capital",
+                ],
+                end_date=end_date,
+                period="ttm",
+                limit=5,  # 增加获取的数据量，确保我们有足够的数据
+            )
+
+            print(f"Financial line items response: {financial_line_items}")
+
+            # 按日期排序
+            sorted_items = sorted(financial_line_items, key=lambda x: x['date'], reverse=True)
+            
+            # 获取最新和次新的日期
+            if len(sorted_items) > 0:
+                current_date = sorted_items[0]['date']
+                previous_date = None
+                for item in sorted_items[1:]:
+                    if item['date'] != current_date:
+                        previous_date = item['date']
+                        break
+            
+            # 创建字典来存储最新的数据
+            current_data = {}
+            previous_data = {}
+            
+            # 按日期对数据进行分组
+            for item in sorted_items:
+                line_item = item['line_item']
+                value = item['value']
+                
+                if item['date'] == current_date:
+                    current_data[line_item] = value
+                elif item['date'] == previous_date:
+                    previous_data[line_item] = value
+
+            print("\nData grouping results:")
+            print(f"Current date: {current_date}")
+            print(f"Previous date: {previous_date}")
+            print(f"Current data: {current_data}")
+            print(f"Previous data: {previous_data}")
+
+            # 检查是否有足够的数据
+            required_fields = ['working_capital', 'net_income', 'depreciation_and_amortization', 
+                             'capital_expenditure', 'free_cash_flow']
+            
+            missing_fields = [field for field in required_fields 
+                            if field not in current_data or field not in previous_data]
+            
+            if missing_fields:
+                print(f"Missing required fields: {missing_fields}")
+                progress.update_status("valuation_agent", ticker, f"Failed: Missing fields - {', '.join(missing_fields)}")
+                continue
+
+            progress.update_status("valuation_agent", ticker, "Calculating owner earnings")
+            try:
+                # Calculate working capital change
+                working_capital_change = current_data['working_capital'] - previous_data['working_capital']
+                print(f"Working capital change: {working_capital_change}")
+            except Exception as e:
+                print(f"Error calculating working capital change: {str(e)}")
+                progress.update_status("valuation_agent", ticker, "Failed: Error in working capital calculation")
+                continue
+
+            try:
+                # Owner Earnings Valuation (Buffett Method)
+                growth_rate = metrics.get('earningsGrowth', 0.05)  # Default to 5% if not available
+                print(f"Using growth rate: {growth_rate}")
+                
+                owner_earnings_value = calculate_owner_earnings_value(
+                    net_income=current_data['net_income'],
+                    depreciation=current_data['depreciation_and_amortization'],
+                    capex=current_data['capital_expenditure'],
+                    working_capital_change=working_capital_change,
+                    growth_rate=growth_rate,
+                    required_return=0.15,
+                    margin_of_safety=0.25,
+                )
+                print(f"Owner earnings value: {owner_earnings_value}")
+            except Exception as e:
+                print(f"Error calculating owner earnings value: {str(e)}")
+                progress.update_status("valuation_agent", ticker, "Failed: Error in owner earnings calculation")
+                continue
+
+            progress.update_status("valuation_agent", ticker, "Calculating DCF value")
+            try:
+                # DCF Valuation
+                dcf_value = calculate_intrinsic_value(
+                    free_cash_flow=current_data['free_cash_flow'],
+                    growth_rate=growth_rate,
+                    discount_rate=0.10,
+                    terminal_growth_rate=0.03,
+                    num_years=5,
+                )
+                print(f"DCF value: {dcf_value}")
+            except Exception as e:
+                print(f"Error calculating DCF value: {str(e)}")
+                progress.update_status("valuation_agent", ticker, "Failed: Error in DCF calculation")
+                continue
+
+            progress.update_status("valuation_agent", ticker, "Comparing to market value")
+            try:
+                # Get the market cap
+                market_cap = get_market_cap(ticker=ticker)
+                print(f"Market cap: {market_cap}")
+
+                if not market_cap:
+                    print(f"No market cap found for {ticker}")
+                    progress.update_status("valuation_agent", ticker, "Failed: No market cap data")
+                    continue
+
+                # Calculate combined valuation gap (average of both methods)
+                dcf_gap = (dcf_value - market_cap) / market_cap
+                owner_earnings_gap = (owner_earnings_value - market_cap) / market_cap
+                valuation_gap = (dcf_gap + owner_earnings_gap) / 2
+
+                print(f"DCF gap: {dcf_gap}")
+                print(f"Owner earnings gap: {owner_earnings_gap}")
+                print(f"Combined valuation gap: {valuation_gap}")
+
+                if valuation_gap > 0.15:  # More than 15% undervalued
+                    signal = "bullish"
+                elif valuation_gap < -0.15:  # More than 15% overvalued
+                    signal = "bearish"
+                else:
+                    signal = "neutral"
+
+                # Create the reasoning
+                reasoning = {}
+                reasoning["dcf_analysis"] = {
+                    "signal": ("bullish" if dcf_gap > 0.15 else "bearish" if dcf_gap < -0.15 else "neutral"),
+                    "details": f"Intrinsic Value: ${dcf_value:,.2f}, Market Cap: ${market_cap:,.2f}, Gap: {dcf_gap:.1%}",
+                }
+
+                reasoning["owner_earnings_analysis"] = {
+                    "signal": ("bullish" if owner_earnings_gap > 0.15 else "bearish" if owner_earnings_gap < -0.15 else "neutral"),
+                    "details": f"Owner Earnings Value: ${owner_earnings_value:,.2f}, Market Cap: ${market_cap:,.2f}, Gap: {owner_earnings_gap:.1%}",
+                }
+
+                confidence = round(abs(valuation_gap), 2) * 100
+                valuation_analysis[ticker] = {
+                    "signal": signal,
+                    "confidence": confidence,
+                    "reasoning": reasoning,
+                }
+
+                print(f"Final valuation analysis for {ticker}: {valuation_analysis[ticker]}")
+            except Exception as e:
+                print(f"Error in final calculations: {str(e)}")
+                progress.update_status("valuation_agent", ticker, f"Failed: {str(e)}")
+                continue
+
+        except Exception as e:
+            print(f"Unexpected error processing {ticker}: {str(e)}")
+            progress.update_status("valuation_agent", ticker, f"Failed: Unexpected error - {str(e)}")
             continue
-        
-        metrics = financial_metrics[0]
-
-        progress.update_status("valuation_agent", ticker, "Gathering line items")
-        # Fetch the specific line_items that we need for valuation purposes
-        financial_line_items = search_line_items(
-            ticker=ticker,
-            line_items=[
-                "free_cash_flow",
-                "net_income",
-                "depreciation_and_amortization",
-                "capital_expenditure",
-                "working_capital",
-            ],
-            end_date=end_date,
-            period="ttm",
-            limit=2,
-        )
-
-        # Add safety check for financial line items
-        if len(financial_line_items) < 2:
-            progress.update_status("valuation_agent", ticker, "Failed: Insufficient financial line items")
-            continue
-
-        # Pull the current and previous financial line items
-        current_financial_line_item = financial_line_items[0]
-        previous_financial_line_item = financial_line_items[1]
-
-        progress.update_status("valuation_agent", ticker, "Calculating owner earnings")
-        # Calculate working capital change
-        working_capital_change = current_financial_line_item.working_capital - previous_financial_line_item.working_capital
-
-        # Owner Earnings Valuation (Buffett Method)
-        owner_earnings_value = calculate_owner_earnings_value(
-            net_income=current_financial_line_item.net_income,
-            depreciation=current_financial_line_item.depreciation_and_amortization,
-            capex=current_financial_line_item.capital_expenditure,
-            working_capital_change=working_capital_change,
-            growth_rate=metrics.earnings_growth,
-            required_return=0.15,
-            margin_of_safety=0.25,
-        )
-
-        progress.update_status("valuation_agent", ticker, "Calculating DCF value")
-        # DCF Valuation
-        dcf_value = calculate_intrinsic_value(
-            free_cash_flow=current_financial_line_item.free_cash_flow,
-            growth_rate=metrics.earnings_growth,
-            discount_rate=0.10,
-            terminal_growth_rate=0.03,
-            num_years=5,
-        )
-
-        progress.update_status("valuation_agent", ticker, "Comparing to market value")
-        # Get the market cap
-        market_cap = get_market_cap(ticker=ticker, end_date=end_date)
-
-        # Calculate combined valuation gap (average of both methods)
-        dcf_gap = (dcf_value - market_cap) / market_cap
-        owner_earnings_gap = (owner_earnings_value - market_cap) / market_cap
-        valuation_gap = (dcf_gap + owner_earnings_gap) / 2
-
-        if valuation_gap > 0.15:  # More than 15% undervalued
-            signal = "bullish"
-        elif valuation_gap < -0.15:  # More than 15% overvalued
-            signal = "bearish"
-        else:
-            signal = "neutral"
-
-        # Create the reasoning
-        reasoning = {}
-        reasoning["dcf_analysis"] = {
-            "signal": ("bullish" if dcf_gap > 0.15 else "bearish" if dcf_gap < -0.15 else "neutral"),
-            "details": f"Intrinsic Value: ${dcf_value:,.2f}, Market Cap: ${market_cap:,.2f}, Gap: {dcf_gap:.1%}",
-        }
-
-        reasoning["owner_earnings_analysis"] = {
-            "signal": ("bullish" if owner_earnings_gap > 0.15 else "bearish" if owner_earnings_gap < -0.15 else "neutral"),
-            "details": f"Owner Earnings Value: ${owner_earnings_value:,.2f}, Market Cap: ${market_cap:,.2f}, Gap: {owner_earnings_gap:.1%}",
-        }
-
-        confidence = round(abs(valuation_gap), 2) * 100
-        valuation_analysis[ticker] = {
-            "signal": signal,
-            "confidence": confidence,
-            "reasoning": reasoning,
-        }
 
         progress.update_status("valuation_agent", ticker, "Done")
 
+    print("\nFinal valuation analysis:", valuation_analysis)
     message = HumanMessage(
         content=json.dumps(valuation_analysis),
         name="valuation_agent",

@@ -7,9 +7,51 @@ from graph.state import AgentState, show_agent_reasoning
 import json
 import pandas as pd
 import numpy as np
+from typing import Dict, Any, Tuple
 
-from tools.api import get_prices, prices_to_df
+from tools.yfinance_api import get_prices, prices_to_df
 from utils.progress import progress
+
+# 添加窗口配置
+WINDOW_CONFIG = {
+    "min_required_days": 21,  # 最小需要的数据天数
+    "windows": {
+        "short_term": 21,    # 1个月
+        "medium_term": 63,   # 3个月
+        "long_term": 126,    # 6个月
+    }
+}
+
+def check_data_quality(df: pd.DataFrame) -> Dict[str, Any]:
+    """
+    检查数据质量并返回可用的时间窗口
+    
+    Returns:
+        Dict 包含:
+        - is_valid: 数据是否满足最小要求
+        - available_windows: 可用的时间窗口列表
+        - data_points: 可用数据点数量
+        - warning: 警告信息（如果有）
+    """
+    available_days = len(df)
+    
+    result = {
+        "is_valid": available_days >= WINDOW_CONFIG["min_required_days"],
+        "available_windows": [],
+        "data_points": available_days,
+        "warning": None
+    }
+    
+    if not result["is_valid"]:
+        result["warning"] = f"Insufficient data: {available_days} days available, {WINDOW_CONFIG['min_required_days']} required"
+        return result
+        
+    # 检查每个时间窗口的可用性
+    for window_name, window_size in WINDOW_CONFIG["windows"].items():
+        if available_days >= window_size:
+            result["available_windows"].append(window_name)
+            
+    return result
 
 
 ##### Technical Analyst #####
@@ -46,6 +88,17 @@ def technical_analyst_agent(state: AgentState):
 
         # Convert prices to a DataFrame
         prices_df = prices_to_df(prices)
+        
+        # 打印数据长度信息
+        print(f"\n=== Data Analysis for {ticker} ===")
+        print(f"Total trading days: {len(prices_df)}")
+        print(f"Date range: from {prices_df.index.min()} to {prices_df.index.max()}")
+        print(f"Required days for analysis:")
+        print(f"- Momentum 3M: 63 days")
+        print(f"- Momentum 6M: 126 days")
+        print(f"- Volatility: 63 days")
+        print(f"- Statistical: 63 days")
+        print("============================\n")
 
         progress.update_status("technical_analyst_agent", ticker, "Calculating trend signals")
         trend_signals = calculate_trend_signals(prices_df)
@@ -218,27 +271,73 @@ def calculate_mean_reversion_signals(prices_df):
 
 def calculate_momentum_signals(prices_df):
     """
-    Multi-factor momentum strategy
+    改进的多时间框架动量策略
     """
-    # Price momentum
+    # 检查数据质量
+    quality = check_data_quality(prices_df)
+    if not quality["is_valid"]:
+        return {
+            "signal": "neutral",
+            "confidence": 0.5,
+            "metrics": {"warning": quality["warning"]},
+            "data_quality": quality
+        }
+    
+    # 计算收益率
     returns = prices_df["close"].pct_change()
-    mom_1m = returns.rolling(21).sum()
-    mom_3m = returns.rolling(63).sum()
-    mom_6m = returns.rolling(126).sum()
+    metrics = {}
+    
+    # 根据可用窗口计算动量
+    if "short_term" in quality["available_windows"]:
+        metrics["momentum_1m"] = float(returns.rolling(WINDOW_CONFIG["windows"]["short_term"]).sum().iloc[-1])
+        
+    if "medium_term" in quality["available_windows"]:
+        metrics["momentum_3m"] = float(returns.rolling(WINDOW_CONFIG["windows"]["medium_term"]).sum().iloc[-1])
+        
+    if "long_term" in quality["available_windows"]:
+        metrics["momentum_6m"] = float(returns.rolling(WINDOW_CONFIG["windows"]["long_term"]).sum().iloc[-1])
+    
+    # 计算成交量动量（使用最短可用窗口）
+    volume_ma = prices_df["volume"].rolling(WINDOW_CONFIG["windows"]["short_term"]).mean()
+    metrics["volume_momentum"] = float(prices_df["volume"].iloc[-1] / volume_ma.iloc[-1])
+    
+    # 根据可用指标动态计算信号
+    signal, confidence = calculate_momentum_signal(metrics)
+    
+    return {
+        "signal": signal,
+        "confidence": confidence,
+        "metrics": metrics,
+        "data_quality": quality
+    }
 
-    # Volume momentum
-    volume_ma = prices_df["volume"].rolling(21).mean()
-    volume_momentum = prices_df["volume"] / volume_ma
-
-    # Relative strength
-    # (would compare to market/sector in real implementation)
-
-    # Calculate momentum score
-    momentum_score = (0.4 * mom_1m + 0.3 * mom_3m + 0.3 * mom_6m).iloc[-1]
-
-    # Volume confirmation
-    volume_confirmation = volume_momentum.iloc[-1] > 1.0
-
+def calculate_momentum_signal(metrics: Dict[str, float]) -> Tuple[str, float]:
+    """
+    根据可用的动量指标计算综合信号
+    """
+    # 初始化权重
+    weights = {
+        "momentum_1m": 0.4,
+        "momentum_3m": 0.3,
+        "momentum_6m": 0.3
+    }
+    
+    # 调整权重基于可用指标
+    available_weights = {k: v for k, v in weights.items() if k in metrics}
+    if available_weights:
+        # 重新归一化权重
+        weight_sum = sum(available_weights.values())
+        available_weights = {k: v/weight_sum for k, v in available_weights.items()}
+    
+    # 计算加权动量得分
+    momentum_score = 0
+    for indicator, weight in available_weights.items():
+        momentum_score += metrics[indicator] * weight
+    
+    # 加入成交量确认
+    volume_confirmation = metrics.get("volume_momentum", 1.0) > 1.0
+    
+    # 生成信号
     if momentum_score > 0.05 and volume_confirmation:
         signal = "bullish"
         confidence = min(abs(momentum_score) * 5, 1.0)
@@ -248,103 +347,334 @@ def calculate_momentum_signals(prices_df):
     else:
         signal = "neutral"
         confidence = 0.5
-
-    return {
-        "signal": signal,
-        "confidence": confidence,
-        "metrics": {
-            "momentum_1m": float(mom_1m.iloc[-1]),
-            "momentum_3m": float(mom_3m.iloc[-1]),
-            "momentum_6m": float(mom_6m.iloc[-1]),
-            "volume_momentum": float(volume_momentum.iloc[-1]),
-        },
-    }
+    
+    return signal, confidence
 
 
 def calculate_volatility_signals(prices_df):
     """
-    Volatility-based trading strategy
+    波动率分析策略
+    
+    核心思想：
+    1. 波动率具有均值回归特性
+    2. 波动率变化往往领先于价格变化
+    3. 极端波动率环境通常预示着市场转折
     """
-    # Calculate various volatility metrics
-    returns = prices_df["close"].pct_change()
-
-    # Historical volatility
-    hist_vol = returns.rolling(21).std() * math.sqrt(252)
-
-    # Volatility regime detection
-    vol_ma = hist_vol.rolling(63).mean()
-    vol_regime = hist_vol / vol_ma
-
-    # Volatility mean reversion
-    vol_z_score = (hist_vol - vol_ma) / hist_vol.rolling(63).std()
-
-    # ATR ratio
-    atr = calculate_atr(prices_df)
-    atr_ratio = atr / prices_df["close"]
-
-    # Generate signal based on volatility regime
-    current_vol_regime = vol_regime.iloc[-1]
-    vol_z = vol_z_score.iloc[-1]
-
-    if current_vol_regime < 0.8 and vol_z < -1:
-        signal = "bullish"  # Low vol regime, potential for expansion
-        confidence = min(abs(vol_z) / 3, 1.0)
-    elif current_vol_regime > 1.2 and vol_z > 1:
-        signal = "bearish"  # High vol regime, potential for contraction
-        confidence = min(abs(vol_z) / 3, 1.0)
-    else:
-        signal = "neutral"
-        confidence = 0.5
-
+    # 检查数据质量
+    quality = check_data_quality(prices_df)
+    if not quality["is_valid"]:
+        return {
+            "signal": "neutral",
+            "confidence": 0.5,
+            "metrics": {"warning": quality["warning"]},
+            "data_quality": quality
+        }
+    
+    # 计算对数收益率（更符合正态分布假设）
+    log_returns = np.log(prices_df["close"] / prices_df["close"].shift(1))
+    metrics = {}
+    
+    # 1. 基础波动率计算
+    # 使用最短窗口计算基础波动率
+    short_vol = log_returns.rolling(WINDOW_CONFIG["windows"]["short_term"]).std() * math.sqrt(252)
+    metrics["current_volatility"] = float(short_vol.iloc[-1])
+    
+    # 2. 波动率趋势分析
+    if "medium_term" in quality["available_windows"]:
+        # 计算中期波动率
+        medium_vol = log_returns.rolling(WINDOW_CONFIG["windows"]["medium_term"]).std() * math.sqrt(252)
+        metrics["medium_term_volatility"] = float(medium_vol.iloc[-1])
+        
+        # 波动率变化率
+        vol_change = (short_vol / medium_vol - 1) * 100
+        metrics["volatility_change"] = float(vol_change.iloc[-1])
+        
+        # 波动率趋势（使用简单线性回归）
+        vol_trend = calculate_linear_trend(short_vol.tail(WINDOW_CONFIG["windows"]["medium_term"]))
+        metrics["volatility_trend"] = float(vol_trend)
+    
+    # 3. 波动率均值回归分析
+    if "long_term" in quality["available_windows"]:
+        # 长期波动率均值
+        long_vol = log_returns.rolling(WINDOW_CONFIG["windows"]["long_term"]).std() * math.sqrt(252)
+        metrics["long_term_volatility"] = float(long_vol.iloc[-1])
+        
+        # 计算当前波动率相对于长期均值的偏离程度
+        vol_deviation = (short_vol - long_vol) / long_vol
+        metrics["volatility_deviation"] = float(vol_deviation.iloc[-1])
+        
+        # 计算波动率的波动率（二阶波动率）
+        vol_of_vol = short_vol.rolling(WINDOW_CONFIG["windows"]["medium_term"]).std() / short_vol.rolling(WINDOW_CONFIG["windows"]["medium_term"]).mean()
+        metrics["volatility_of_volatility"] = float(vol_of_vol.iloc[-1])
+    
+    # 4. 计算真实波动率指标（考虑跳空）
+    atr = calculate_atr(prices_df, WINDOW_CONFIG["windows"]["short_term"])
+    metrics["atr_ratio"] = float(atr.iloc[-1] / prices_df["close"].iloc[-1])
+    
+    # 根据可用指标动态计算信号
+    signal, confidence = calculate_volatility_signal(metrics)
+    
     return {
         "signal": signal,
         "confidence": confidence,
-        "metrics": {
-            "historical_volatility": float(hist_vol.iloc[-1]),
-            "volatility_regime": float(current_vol_regime),
-            "volatility_z_score": float(vol_z),
-            "atr_ratio": float(atr_ratio.iloc[-1]),
-        },
+        "metrics": metrics,
+        "data_quality": quality
     }
+
+def calculate_linear_trend(series: pd.Series) -> float:
+    """
+    使用简单线性回归计算趋势斜率
+    """
+    x = np.arange(len(series))
+    y = series.values
+    slope, _ = np.polyfit(x, y, 1)
+    return slope
+
+def calculate_volatility_signal(metrics: Dict[str, float]) -> Tuple[str, float]:
+    """
+    基于波动率指标综合计算交易信号
+    
+    信号逻辑：
+    1. 基础信号：基于当前波动率水平
+    2. 趋势信号：基于波动率变化趋势
+    3. 均值回归信号：基于波动率偏离程度
+    """
+    signal = "neutral"
+    confidence = 0.5
+    
+    # 1. 基础波动率评估
+    current_vol = metrics["current_volatility"]
+    
+    # 2. 考虑波动率趋势（如果可用）
+    if "volatility_trend" in metrics and "volatility_change" in metrics:
+        vol_trend = metrics["volatility_trend"]
+        vol_change = metrics["volatility_change"]
+        
+        # 波动率快速下降可能预示着市场即将上涨
+        if vol_trend < 0 and vol_change < -10:
+            signal = "bullish"
+            confidence = min(abs(vol_change) / 20, 0.8)
+        # 波动率快速上升可能预示着市场即将下跌
+        elif vol_trend > 0 and vol_change > 10:
+            signal = "bearish"
+            confidence = min(abs(vol_change) / 20, 0.8)
+    
+    # 3. 考虑均值回归（如果可用）
+    if "volatility_deviation" in metrics and "volatility_of_volatility" in metrics:
+        vol_dev = metrics["volatility_deviation"]
+        vol_of_vol = metrics["volatility_of_volatility"]
+        
+        # 极端偏离通常预示着反转
+        if abs(vol_dev) > 2:  # 显著偏离
+            # 如果波动率的波动率也很高，增加信号强度
+            if vol_of_vol > 0.2:
+                confidence = min(confidence * 1.2, 1.0)
+            
+            # 当前信号是中性时，生成新信号
+            if signal == "neutral":
+                signal = "bearish" if vol_dev > 0 else "bullish"
+                confidence = min(abs(vol_dev) / 3, 0.8)
+    
+    # 4. 使用ATR确认（始终可用）
+    atr_ratio = metrics["atr_ratio"]
+    if atr_ratio > 0.03 and signal == "bearish":  # 高ATR确认看跌
+        confidence = min(confidence * 1.1, 1.0)
+    elif atr_ratio < 0.01 and signal == "bullish":  # 低ATR确认看涨
+        confidence = min(confidence * 1.1, 1.0)
+    
+    return signal, confidence
 
 
 def calculate_stat_arb_signals(prices_df):
     """
-    Statistical arbitrage signals based on price action analysis
+    统计套利策略
+    
+    核心思想：
+    1. 价格分布特征分析
+    2. 均值回归特性检验
+    3. 市场效率性分析
+    4. 异常行为检测
     """
-    # Calculate price distribution statistics
-    returns = prices_df["close"].pct_change()
-
-    # Skewness and kurtosis
-    skew = returns.rolling(63).skew()
-    kurt = returns.rolling(63).kurt()
-
-    # Test for mean reversion using Hurst exponent
-    hurst = calculate_hurst_exponent(prices_df["close"])
-
-    # Correlation analysis
-    # (would include correlation with related securities in real implementation)
-
-    # Generate signal based on statistical properties
-    if hurst < 0.4 and skew.iloc[-1] > 1:
-        signal = "bullish"
-        confidence = (0.5 - hurst) * 2
-    elif hurst < 0.4 and skew.iloc[-1] < -1:
-        signal = "bearish"
-        confidence = (0.5 - hurst) * 2
-    else:
-        signal = "neutral"
-        confidence = 0.5
-
+    # 检查数据质量
+    quality = check_data_quality(prices_df)
+    if not quality["is_valid"]:
+        return {
+            "signal": "neutral",
+            "confidence": 0.5,
+            "metrics": {"warning": quality["warning"]},
+            "data_quality": quality
+        }
+    
+    # 计算对数收益率
+    log_returns = np.log(prices_df["close"] / prices_df["close"].shift(1))
+    metrics = {}
+    
+    # 1. 基础统计特征
+    if "short_term" in quality["available_windows"]:
+        window = WINDOW_CONFIG["windows"]["short_term"]
+        # 短期统计特征
+        metrics.update(calculate_distribution_metrics(log_returns, window, "short_term"))
+    
+    # 2. 中期统计特征
+    if "medium_term" in quality["available_windows"]:
+        window = WINDOW_CONFIG["windows"]["medium_term"]
+        # 中期统计特征
+        metrics.update(calculate_distribution_metrics(log_returns, window, "medium_term"))
+        
+        # 计算Hurst指数（需要足够的数据点）
+        metrics["hurst_exponent"] = float(calculate_hurst_exponent(prices_df["close"]))
+        
+        # 计算自相关性
+        metrics["autocorrelation"] = float(calculate_autocorrelation(log_returns, window))
+    
+    # 3. 长期统计特征
+    if "long_term" in quality["available_windows"]:
+        window = WINDOW_CONFIG["windows"]["long_term"]
+        # 长期统计特征
+        metrics.update(calculate_distribution_metrics(log_returns, window, "long_term"))
+        
+        # 计算长期趋势强度
+        metrics["trend_strength"] = float(calculate_trend_strength(prices_df["close"], window))
+    
+    # 4. 价格效率性分析
+    metrics["price_efficiency"] = float(calculate_price_efficiency(prices_df["close"]))
+    
+    # 根据可用指标动态计算信号
+    signal, confidence = calculate_stat_arb_signal(metrics)
+    
     return {
         "signal": signal,
         "confidence": confidence,
-        "metrics": {
-            "hurst_exponent": float(hurst),
-            "skewness": float(skew.iloc[-1]),
-            "kurtosis": float(kurt.iloc[-1]),
-        },
+        "metrics": metrics,
+        "data_quality": quality
     }
+
+def calculate_distribution_metrics(returns: pd.Series, window: int, prefix: str) -> Dict[str, float]:
+    """
+    计算收益率分布的统计特征
+    """
+    metrics = {}
+    
+    # 基础统计量
+    rolling_mean = returns.rolling(window).mean()
+    rolling_std = returns.rolling(window).std()
+    
+    # 标准化收益率（用于计算高阶矩）
+    standardized_returns = (returns - rolling_mean) / rolling_std
+    
+    # 计算统计矩
+    metrics[f"{prefix}_skewness"] = float(standardized_returns.rolling(window).skew().iloc[-1])
+    metrics[f"{prefix}_kurtosis"] = float(standardized_returns.rolling(window).kurt().iloc[-1])
+    
+    # 计算分位数
+    for q in [0.05, 0.25, 0.75, 0.95]:
+        metrics[f"{prefix}_quantile_{int(q*100)}"] = float(returns.rolling(window).quantile(q).iloc[-1])
+    
+    return metrics
+
+def calculate_autocorrelation(returns: pd.Series, lag: int) -> float:
+    """
+    计算收益率的自相关性
+    """
+    return returns.autocorr(lag)
+
+def calculate_price_efficiency(prices: pd.Series) -> float:
+    """
+    计算价格效率比率
+    价格效率 = 直线距离 / 实际路径
+    效率值接近1表示趋势性强，接近0表示波动性强
+    """
+    direct_distance = abs(prices.iloc[-1] - prices.iloc[0])
+    path_distance = abs(prices.diff()).sum()
+    return direct_distance / path_distance if path_distance != 0 else 1.0
+
+def calculate_trend_strength(prices: pd.Series, window: int) -> float:
+    """
+    计算趋势强度
+    使用线性回归R方值来衡量趋势强度
+    """
+    x = np.arange(len(prices[-window:]))
+    y = prices[-window:].values
+    slope, intercept = np.polyfit(x, y, 1)
+    y_pred = slope * x + intercept
+    r_squared = 1 - np.sum((y - y_pred) ** 2) / np.sum((y - np.mean(y)) ** 2)
+    return r_squared
+
+def calculate_stat_arb_signal(metrics: Dict[str, float]) -> Tuple[str, float]:
+    """
+    基于统计特征综合计算交易信号
+    
+    信号逻辑：
+    1. 均值回归信号：基于Hurst指数和自相关性
+    2. 分布异常信号：基于偏度和峰度
+    3. 效率信号：基于价格效率性
+    4. 趋势信号：基于趋势强度
+    """
+    signal = "neutral"
+    confidence = 0.5
+    
+    # 1. 评估均值回归特性
+    if "hurst_exponent" in metrics and "autocorrelation" in metrics:
+        hurst = metrics["hurst_exponent"]
+        autocorr = metrics["autocorrelation"]
+        
+        # Hurst指数显示强均值回归特性
+        if hurst < 0.4 and abs(autocorr) > 0.2:
+            mean_reversion_signal = True
+            mean_reversion_strength = (0.5 - hurst) * 2
+        else:
+            mean_reversion_signal = False
+            mean_reversion_strength = 0
+    else:
+        mean_reversion_signal = False
+        mean_reversion_strength = 0
+    
+    # 2. 评估分布异常
+    if "medium_term_skewness" in metrics and "medium_term_kurtosis" in metrics:
+        skew = metrics["medium_term_skewness"]
+        kurt = metrics["medium_term_kurtosis"]
+        
+        # 显著的分布偏离
+        if abs(skew) > 1 or abs(kurt) > 4:
+            distribution_signal = True
+            # 根据偏度方向确定信号
+            distribution_direction = 1 if skew > 0 else -1
+            distribution_strength = min((abs(skew) + abs(kurt)/4) / 4, 1.0)
+        else:
+            distribution_signal = False
+            distribution_direction = 0
+            distribution_strength = 0
+    else:
+        distribution_signal = False
+        distribution_direction = 0
+        distribution_strength = 0
+    
+    # 3. 评估价格效率性
+    efficiency = metrics["price_efficiency"]
+    efficiency_signal = efficiency < 0.3  # 低效率表示可能存在套利机会
+    
+    # 4. 综合信号
+    if mean_reversion_signal and distribution_signal:
+        # 均值回归和分布异常共同确认
+        signal = "bullish" if distribution_direction < 0 else "bearish"
+        confidence = min(mean_reversion_strength * distribution_strength * 1.2, 1.0)
+        
+        # 如果效率性也确认，提高置信度
+        if efficiency_signal:
+            confidence = min(confidence * 1.2, 1.0)
+    
+    elif mean_reversion_signal:
+        # 仅有均值回归信号
+        recent_returns = metrics.get("short_term_quantile_75", 0) - metrics.get("short_term_quantile_25", 0)
+        signal = "bullish" if recent_returns < 0 else "bearish"
+        confidence = mean_reversion_strength * 0.8
+    
+    elif distribution_signal and efficiency_signal:
+        # 分布异常和低效率共同确认
+        signal = "bullish" if distribution_direction < 0 else "bearish"
+        confidence = distribution_strength * 0.7
+    
+    return signal, confidence
 
 
 def weighted_signal_combination(signals, weights):

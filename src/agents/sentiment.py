@@ -5,8 +5,8 @@ import pandas as pd
 import numpy as np
 import json
 
-from tools.api import get_insider_trades, get_company_news
-
+# from tools.api import get_insider_trades, get_company_news
+from tools.yfinance_api import get_insider_trades, get_company_news
 
 ##### Sentiment Agent #####
 def sentiment_agent(state: AgentState):

@@ -93,7 +93,7 @@ class InsiderTrade(BaseModel):
     shares_owned_before_transaction: float | None
     shares_owned_after_transaction: float | None
     security_title: str | None
-    filing_date: str
+    filing_date: str | None
 
 
 class InsiderTradeResponse(BaseModel):

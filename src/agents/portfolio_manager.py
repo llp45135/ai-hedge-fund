@@ -54,7 +54,29 @@ def portfolio_management_agent(state: AgentState):
         ticker_signals = {}
         for agent, signals in analyst_signals.items():
             if agent != "risk_management_agent" and ticker in signals:
-                ticker_signals[agent] = {"signal": signals[ticker]["signal"], "confidence": signals[ticker]["confidence"]}
+                # 添加类型检查和错误处理
+                try:
+                    if isinstance(signals, dict) and isinstance(signals[ticker], dict):
+                        # 字典格式处理
+                        ticker_signals[agent] = {
+                            "signal": signals[ticker].get("signal"),
+                            "confidence": signals[ticker].get("confidence", 0.0)
+                        }
+                    elif isinstance(signals, list):
+                        # 列表格式处理
+                        signal_data = next((s for s in signals if s.get("ticker") == ticker), None)
+                        if signal_data:
+                            ticker_signals[agent] = {
+                                "signal": signal_data.get("signal"),
+                                "confidence": signal_data.get("confidence", 0.0)
+                            }
+                except Exception as e:
+                    print(f"Error processing signals for agent {agent} and ticker {ticker}: {str(e)}")
+                    # 提供一个默认值
+                    ticker_signals[agent] = {
+                        "signal": "HOLD",
+                        "confidence": 0.0
+                    }
         signals_by_ticker[ticker] = ticker_signals
 
     progress.update_status("portfolio_management_agent", None, "Preparing trading strategy")
@@ -156,10 +178,25 @@ def portfolio_management_agent(state: AgentState):
 
 def make_decision(prompt, tickers):
     """Attempts to get a decision from the LLM with retry logic"""
-    llm = ChatOpenAI(model="gpt-4o").with_structured_output(
+
+    # llm = ChatOpenAI(model="gpt-4o").with_structured_output(
+    #     PortfolioManagerOutput,
+    #     method="function_calling",
+    # )
+
+    # Invoke the LLM
+    llm = ChatOpenAI(
+        model='deepseek-chat',
+        openai_api_key='sk-87e452418342440383d09e13400c8e39',
+        openai_api_base='https://api.deepseek.com',
+        temperature=0.0,
+        max_tokens=4096
+    ).with_structured_output(
         PortfolioManagerOutput,
         method="function_calling",
     )
+
+    result = llm.invoke(prompt)
     max_retries = 3
     for attempt in range(max_retries):
         try:
