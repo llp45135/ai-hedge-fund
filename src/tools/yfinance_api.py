@@ -124,18 +124,6 @@ def search_line_items(
     print("\n--- Searching for requested line items ---")
     print(f"Requested items: {line_items}")
     
-    # 获取所有可用的日期
-    all_dates = set()
-    if not cashflow.empty:
-        all_dates.update(cashflow.columns)
-    if not balance.empty:
-        all_dates.update(balance.columns)
-    if not income.empty:
-        all_dates.update(income.columns)
-    
-    # 按日期排序（降序）
-    all_dates = sorted(list(all_dates), reverse=True)
-    
     for item in line_items:
         print(f"\nSearching for: {item}")
         # 获取该项目的所有可能的字段名
@@ -147,54 +135,51 @@ def search_line_items(
             # 在现金流量表中查找
             if not cashflow.empty and field in cashflow.index:
                 print(f"Found {field} in cash flow statement")
-                for date in all_dates:
-                    if date in cashflow.columns:
-                        value = cashflow.loc[field, date]
-                        if pd.notna(value):  # 只添加非空值
-                            results.append({
-                                "ticker": ticker,
-                                "line_item": item,
-                                "value": float(value),
-                                "date": date.strftime("%Y-%m-%d"),
-                                "period": period,
-                                "source": "cashflow"
-                            })
+                values = cashflow.loc[field]
+                for date, value in values.items():
+                    if pd.notna(value):  # 只添加非空值
+                        results.append({
+                            "ticker": ticker,
+                            "line_item": item,
+                            "value": float(value),
+                            "date": date.strftime("%Y-%m-%d"),
+                            "period": period,
+                            "source": "cashflow"
+                        })
                 found = True
                 break
                 
             # 在资产负债表中查找
             elif not balance.empty and field in balance.index:
                 print(f"Found {field} in balance sheet")
-                for date in all_dates:
-                    if date in balance.columns:
-                        value = balance.loc[field, date]
-                        if pd.notna(value):  # 只添加非空值
-                            results.append({
-                                "ticker": ticker,
-                                "line_item": item,
-                                "value": float(value),
-                                "date": date.strftime("%Y-%m-%d"),
-                                "period": period,
-                                "source": "balance"
-                            })
+                values = balance.loc[field]
+                for date, value in values.items():
+                    if pd.notna(value):  # 只添加非空值
+                        results.append({
+                            "ticker": ticker,
+                            "line_item": item,
+                            "value": float(value),
+                            "date": date.strftime("%Y-%m-%d"),
+                            "period": period,
+                            "source": "balance"
+                        })
                 found = True
                 break
                 
             # 在利润表中查找
             elif not income.empty and field in income.index:
                 print(f"Found {field} in income statement")
-                for date in all_dates:
-                    if date in income.columns:
-                        value = income.loc[field, date]
-                        if pd.notna(value):  # 只添加非空值
-                            results.append({
-                                "ticker": ticker,
-                                "line_item": item,
-                                "value": float(value),
-                                "date": date.strftime("%Y-%m-%d"),
-                                "period": period,
-                                "source": "income"
-                            })
+                values = income.loc[field]
+                for date, value in values.items():
+                    if pd.notna(value):  # 只添加非空值
+                        results.append({
+                            "ticker": ticker,
+                            "line_item": item,
+                            "value": float(value),
+                            "date": date.strftime("%Y-%m-%d"),
+                            "period": period,
+                            "source": "income"
+                        })
                 found = True
                 break
                 
@@ -207,21 +192,9 @@ def search_line_items(
         for r in results[:3]:
             print(r)
     
-    # 按日期排序（降序）
+    # 按日期排序（降序）并应用限制
     results.sort(key=lambda x: x["date"], reverse=True)
-    
-    # 确保每个时期都有完整的数据
-    dates = sorted(list(set(r["date"] for r in results)), reverse=True)
-    complete_periods = []
-    
-    for date in dates:
-        period_items = [r for r in results if r["date"] == date]
-        if len(period_items) == len(line_items):  # 如果这个时期有所有需要的数据
-            complete_periods.extend(period_items)
-            if len(complete_periods) >= limit * len(line_items):  # 如果已经有足够的完整时期
-                break
-    
-    return complete_periods
+    return results[:limit]
 
 def get_insider_trades(
     ticker: str,

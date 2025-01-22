@@ -190,23 +190,43 @@ def technical_analyst_agent(state: AgentState):
 
 def calculate_trend_signals(prices_df):
     """
-    Advanced trend following strategy using multiple timeframes and indicators
+    改进的趋势跟踪策略,增加成交量确认
+    
+    核心改进:
+    1. 多周期成交量分析
+    2. 成交量相对强度指标
+    3. 价格-成交量协同性分析
+    4. 动态调整趋势置信度
     """
-    # Calculate EMAs for multiple timeframes
+    # 计算价格EMAs
     ema_8 = calculate_ema(prices_df, 8)
     ema_21 = calculate_ema(prices_df, 21)
     ema_55 = calculate_ema(prices_df, 55)
 
-    # Calculate ADX for trend strength
+    # 计算成交量EMAs
+    volume_ema_5 = calculate_volume_ema(prices_df, 5)
+    volume_ema_20 = calculate_volume_ema(prices_df, 20)
+    
+    # 计算ADX
     adx = calculate_adx(prices_df, 14)
-
-    # Determine trend direction and strength
+    
+    # === 1. 价格趋势分析 ===
     short_trend = ema_8 > ema_21
     medium_trend = ema_21 > ema_55
-
-    # Combine signals with confidence weighting
+    
+    # === 2. 成交量趋势分析 ===
+    volume_trend = calculate_volume_trend(prices_df, volume_ema_5, volume_ema_20)
+    
+    # === 3. 价格-成交量协同性分析 ===
+    price_volume_sync = calculate_price_volume_sync(prices_df, ema_8)
+    
+    # === 4. 成交量相对强度 ===
+    volume_rsi = calculate_volume_rsi(prices_df)
+    
+    # === 5. 综合分析 ===
     trend_strength = adx["adx"].iloc[-1] / 100.0
-
+    
+    # 基础趋势信号
     if short_trend.iloc[-1] and medium_trend.iloc[-1]:
         signal = "bullish"
         confidence = trend_strength
@@ -216,6 +236,15 @@ def calculate_trend_signals(prices_df):
     else:
         signal = "neutral"
         confidence = 0.5
+    
+    # 根据成交量特征调整置信度
+    confidence = adjust_confidence_by_volume(
+        signal,
+        confidence,
+        volume_trend,
+        price_volume_sync,
+        volume_rsi.iloc[-1]
+    )
 
     return {
         "signal": signal,
@@ -223,8 +252,124 @@ def calculate_trend_signals(prices_df):
         "metrics": {
             "adx": float(adx["adx"].iloc[-1]),
             "trend_strength": float(trend_strength),
+            "volume_trend": float(volume_trend),
+            "price_volume_sync": float(price_volume_sync),
+            "volume_rsi": float(volume_rsi.iloc[-1])
         },
     }
+
+def calculate_volume_ema(df: pd.DataFrame, window: int) -> pd.Series:
+    """计算成交量的指数移动平均"""
+    return df["volume"].ewm(span=window, adjust=False).mean()
+
+def calculate_volume_trend(
+    df: pd.DataFrame,
+    volume_ema_5: pd.Series,
+    volume_ema_20: pd.Series
+) -> float:
+    """
+    计算成交量趋势强度
+    
+    返回值:
+    - > 0: 成交量上升趋势
+    - < 0: 成交量下降趋势
+    - 绝对值表示趋势强度
+    """
+    # 计算短期/长期成交量比值
+    volume_ratio = volume_ema_5 / volume_ema_20
+    
+    # 计算成交量趋势强度(-1到1之间)
+    trend_strength = (volume_ratio.iloc[-1] - 1) * 2
+    
+    # 限制在-1到1之间
+    return max(min(trend_strength, 1), -1)
+
+def calculate_price_volume_sync(df: pd.DataFrame, price_ema: pd.Series) -> float:
+    """
+    计算价格和成交量的协同性
+    
+    返回值:
+    - 1: 完全协同
+    - -1: 完全背离
+    """
+    # 计算价格和成交量的变化率
+    price_change = price_ema.pct_change()
+    volume_change = df["volume"].pct_change()
+    
+    # 计算最近N天的协同性
+    window = 5
+    sync_score = 0
+    
+    for i in range(-window, 0):
+        if price_change.iloc[i] * volume_change.iloc[i] > 0:
+            sync_score += 1
+        else:
+            sync_score -= 1
+    
+    return sync_score / window
+
+def calculate_volume_rsi(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """计算成交量的RSI"""
+    volume_change = df["volume"].diff()
+    
+    # 分别计算成交量增加和减少
+    gains = volume_change.copy()
+    losses = volume_change.copy()
+    gains[gains < 0] = 0
+    losses[losses > 0] = 0
+    losses = abs(losses)
+    
+    # 计算RSI
+    avg_gains = gains.rolling(window=period).mean()
+    avg_losses = losses.rolling(window=period).mean()
+    rs = avg_gains / avg_losses
+    rsi = 100 - (100 / (1 + rs))
+    
+    return rsi
+
+def adjust_confidence_by_volume(
+    signal: str,
+    base_confidence: float,
+    volume_trend: float,
+    price_volume_sync: float,
+    volume_rsi: float
+) -> float:
+    """
+    根据成交量特征调整趋势信号的置信度
+    
+    Args:
+        signal: 基础趋势信号
+        base_confidence: 基础置信度
+        volume_trend: 成交量趋势强度(-1到1)
+        price_volume_sync: 价格-成交量协同性(-1到1)
+        volume_rsi: 成交量RSI(0到100)
+    """
+    confidence = base_confidence
+    
+    # 1. 成交量趋势确认
+    if signal == "bullish" and volume_trend > 0:
+        confidence *= (1 + volume_trend * 0.2)  # 最多增加20%
+    elif signal == "bearish" and volume_trend < 0:
+        confidence *= (1 + abs(volume_trend) * 0.2)
+    else:
+        confidence *= 0.8  # 成交量不确认时降低置信度
+    
+    # 2. 价格-成交量协同性确认
+    if price_volume_sync > 0:
+        confidence *= (1 + price_volume_sync * 0.2)
+    else:
+        confidence *= (1 - abs(price_volume_sync) * 0.2)
+    
+    # 3. 成交量RSI确认
+    if signal == "bullish" and volume_rsi > 50:
+        confidence *= (1 + (volume_rsi - 50) / 250)  # 最多增加20%
+    elif signal == "bearish" and volume_rsi < 50:
+        confidence *= (1 + (50 - volume_rsi) / 250)
+    else:
+        confidence *= 0.9
+    
+    # 确保置信度在0到1之间
+    return max(min(confidence, 1.0), 0.0)
 
 
 def calculate_mean_reversion_signals(prices_df):
