@@ -14,7 +14,8 @@ from agents.technicals import (
     calculate_volume_ema,
     calculate_adx,
     calculate_volume_rsi,
-    calculate_trend_signals
+    calculate_trend_signals,
+    WINDOW_CONFIG
 )
 
 def visualize_trend_signals(prices_df: pd.DataFrame, window_size: int = 200) -> None:
@@ -207,6 +208,8 @@ def visualize_trend_signals(prices_df: pd.DataFrame, window_size: int = 200) -> 
     
     # 添加最新的趋势信号标记
     signal_markers = add_trend_signals(prices_df)
+    print(f"处理的数据点数: {len(prices_df)}")
+    print(f"生成的信号数量: {len(signal_markers)}")
     for marker in signal_markers:
         fig.add_trace(marker, row=1, col=1)
     
@@ -215,45 +218,73 @@ def visualize_trend_signals(prices_df: pd.DataFrame, window_size: int = 200) -> 
 
 def add_trend_signals(prices_df: pd.DataFrame) -> list:
     """
-    在图表上添加趋势信号标记
+    在图表上添加所有历史趋势信号标记
     
     Args:
         prices_df: 包含OHLCV数据的DataFrame
         
     Returns:
-        list: 包含信号标记的图形对象列表
+        list: 包含所有信号标记的图形对象列表
     """
-    signals = calculate_trend_signals(prices_df)
-    
-    # 获取最新的信号
-    latest_signal = signals['signal']
-    confidence = signals['confidence']
-    
-    # 创建信号标记
     signal_markers = []
-    if latest_signal == 'bullish':
-        signal_markers.append(
-            go.Scatter(
-                x=[prices_df.index[-1]],
-                y=[prices_df['low'].iloc[-1]],
-                mode='markers+text',
-                marker=dict(symbol='triangle-up', size=15, color='green'),
-                text=[f'买入 ({confidence:.0f}%)'],
-                textposition='bottom center',
-                showlegend=False
-            )
-        )
-    elif latest_signal == 'bearish':
-        signal_markers.append(
-            go.Scatter(
-                x=[prices_df.index[-1]],
-                y=[prices_df['high'].iloc[-1]],
-                mode='markers+text',
-                marker=dict(symbol='triangle-down', size=15, color='red'),
-                text=[f'卖出 ({confidence:.0f}%)'],
-                textposition='top center',
-                showlegend=False
-            )
-        )
+    min_required_days = WINDOW_CONFIG["min_required_days"]
     
+    # 确保从有足够历史数据的点开始计算
+    for i in range(min_required_days, len(prices_df)):
+        # 使用截至当前的数据计算信号，创建副本而不是视图
+        current_df = prices_df.iloc[:i+1].copy()
+        try:
+            signals = calculate_trend_signals(current_df)
+            
+            # 只在信号发生变化时添加标记
+            if i > min_required_days:  # 确保有前一个信号可比较
+                prev_df = prices_df.iloc[:i].copy()
+                prev_signals = calculate_trend_signals(prev_df)
+                if signals['signal'] == prev_signals['signal']:
+                    continue
+            
+            # 添加信号标记
+            if signals['signal'] == 'bullish':
+                signal_markers.append(
+                    go.Scatter(
+                        x=[current_df.index[-1]],
+                        y=[current_df['low'].iloc[-1]],
+                        mode='markers+text',
+                        marker=dict(
+                            symbol='triangle-up',
+                            size=15,
+                            color='green'
+                        ),
+                        text=[f'买入 ({signals["confidence"]:.0f}%)'],
+                        textposition='bottom center',
+                        name='买入信号',
+                        showlegend=False
+                    )
+                )
+            elif signals['signal'] == 'bearish':
+                signal_markers.append(
+                    go.Scatter(
+                        x=[current_df.index[-1]],
+                        y=[current_df['high'].iloc[-1]],
+                        mode='markers+text',
+                        marker=dict(
+                            symbol='triangle-down',
+                            size=15,
+                            color='red'
+                        ),
+                        text=[f'卖出 ({signals["confidence"]:.0f}%)'],
+                        textposition='top center',
+                        name='卖出信号',
+                        showlegend=False
+                    )
+                )
+            
+            if i % 50 == 0:  # 每50个点打印一次进度
+                print(f"处理进度: {i}/{len(prices_df)}, 当前信号: {signals['signal']}")
+                
+        except Exception as e:
+            print(f"计算信号时出错 (i={i}): {e}")
+            continue
+    
+    print(f"总共生成信号数量: {len(signal_markers)}")
     return signal_markers 
