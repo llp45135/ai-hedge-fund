@@ -12,6 +12,22 @@ from typing import Dict, Any, Tuple
 from tools.yfinance_api import get_prices, prices_to_df
 from utils.progress import progress
 
+from analysis.trend_analysis import analyze_trend
+from analysis.mean_reversion_analysis import (
+    calculate_mean_reversion_signals,
+    calculate_rsi,
+    calculate_bollinger_bands,
+)
+from analysis.momentum_analysis import (
+    calculate_momentum_signals,
+    WINDOW_CONFIG,
+)
+
+from analysis.volatility_analysis import (
+    calculate_volatility_signals,
+    calculate_stat_arb_signals
+)
+
 # 添加窗口配置
 WINDOW_CONFIG = {
     "min_required_days": 21,  # 最小需要的数据天数
@@ -190,310 +206,16 @@ def technical_analyst_agent(state: AgentState):
 
 def calculate_trend_signals(prices_df):
     """
-    改进的趋势跟踪策略,增加成交量确认
+    增强版趋势跟踪策略
     
     核心改进:
-    1. 多周期成交量分析
-    2. 成交量相对强度指标
-    3. 价格-成交量协同性分析
-    4. 动态调整趋势置信度
+    1. 支撑/阻力位分析
+    2. 关键价格水平分析
+    3. 趋势线分析
+    4. 成交量支撑度分析
+    5. 突破确认机制
     """
-    # 计算价格EMAs
-    ema_8 = calculate_ema(prices_df, 8)
-    ema_21 = calculate_ema(prices_df, 21)
-    ema_55 = calculate_ema(prices_df, 55)
-
-    # 计算成交量EMAs
-    volume_ema_5 = calculate_volume_ema(prices_df, 5)
-    volume_ema_20 = calculate_volume_ema(prices_df, 20)
-    
-    # 计算ADX
-    adx = calculate_adx(prices_df, 14)
-    
-    # === 1. 价格趋势分析 ===
-    short_trend = ema_8 > ema_21
-    medium_trend = ema_21 > ema_55
-    
-    # === 2. 成交量趋势分析 ===
-    volume_trend = calculate_volume_trend(prices_df, volume_ema_5, volume_ema_20)
-    
-    # === 3. 价格-成交量协同性分析 ===
-    price_volume_sync = calculate_price_volume_sync(prices_df, ema_8)
-    
-    # === 4. 成交量相对强度 ===
-    volume_rsi = calculate_volume_rsi(prices_df)
-    
-    # === 5. 综合分析 ===
-    trend_strength = adx["adx"].iloc[-1] / 100.0
-    
-    # 基础趋势信号
-    if short_trend.iloc[-1] and medium_trend.iloc[-1]:
-        signal = "bullish"
-        confidence = trend_strength
-    elif not short_trend.iloc[-1] and not medium_trend.iloc[-1]:
-        signal = "bearish"
-        confidence = trend_strength
-    else:
-        signal = "neutral"
-        confidence = 0.5
-    
-    # 根据成交量特征调整置信度
-    confidence = adjust_confidence_by_volume(
-        signal,
-        confidence,
-        volume_trend,
-        price_volume_sync,
-        volume_rsi.iloc[-1]
-    )
-
-    return {
-        "signal": signal,
-        "confidence": confidence,
-        "metrics": {
-            "adx": float(adx["adx"].iloc[-1]),
-            "trend_strength": float(trend_strength),
-            "volume_trend": float(volume_trend),
-            "price_volume_sync": float(price_volume_sync),
-            "volume_rsi": float(volume_rsi.iloc[-1])
-        },
-    }
-
-def calculate_volume_ema(df: pd.DataFrame, window: int) -> pd.Series:
-    """计算成交量的指数移动平均"""
-    return df["volume"].ewm(span=window, adjust=False).mean()
-
-def calculate_volume_trend(
-    df: pd.DataFrame,
-    volume_ema_5: pd.Series,
-    volume_ema_20: pd.Series
-) -> float:
-    """
-    计算成交量趋势强度
-    
-    返回值:
-    - > 0: 成交量上升趋势
-    - < 0: 成交量下降趋势
-    - 绝对值表示趋势强度
-    """
-    # 计算短期/长期成交量比值
-    volume_ratio = volume_ema_5 / volume_ema_20
-    
-    # 计算成交量趋势强度(-1到1之间)
-    trend_strength = (volume_ratio.iloc[-1] - 1) * 2
-    
-    # 限制在-1到1之间
-    return max(min(trend_strength, 1), -1)
-
-def calculate_price_volume_sync(df: pd.DataFrame, price_ema: pd.Series) -> float:
-    """
-    计算价格和成交量的协同性
-    
-    返回值:
-    - 1: 完全协同
-    - -1: 完全背离
-    """
-    # 计算价格和成交量的变化率
-    price_change = price_ema.pct_change()
-    volume_change = df["volume"].pct_change()
-    
-    # 计算最近N天的协同性
-    window = 5
-    sync_score = 0
-    
-    for i in range(-window, 0):
-        if price_change.iloc[i] * volume_change.iloc[i] > 0:
-            sync_score += 1
-        else:
-            sync_score -= 1
-    
-    return sync_score / window
-
-def calculate_volume_rsi(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    """计算成交量的RSI"""
-    volume_change = df["volume"].diff()
-    
-    # 分别计算成交量增加和减少
-    gains = volume_change.copy()
-    losses = volume_change.copy()
-    gains[gains < 0] = 0
-    losses[losses > 0] = 0
-    losses = abs(losses)
-    
-    # 计算RSI
-    avg_gains = gains.rolling(window=period).mean()
-    avg_losses = losses.rolling(window=period).mean()
-    rs = avg_gains / avg_losses
-    rsi = 100 - (100 / (1 + rs))
-    
-    return rsi
-
-def adjust_confidence_by_volume(
-    signal: str,
-    base_confidence: float,
-    volume_trend: float,
-    price_volume_sync: float,
-    volume_rsi: float
-) -> float:
-    """
-    根据成交量特征调整趋势信号的置信度
-    
-    Args:
-        signal: 基础趋势信号
-        base_confidence: 基础置信度
-        volume_trend: 成交量趋势强度(-1到1)
-        price_volume_sync: 价格-成交量协同性(-1到1)
-        volume_rsi: 成交量RSI(0到100)
-    """
-    confidence = base_confidence
-    
-    # 1. 成交量趋势确认
-    if signal == "bullish" and volume_trend > 0:
-        confidence *= (1 + volume_trend * 0.2)  # 最多增加20%
-    elif signal == "bearish" and volume_trend < 0:
-        confidence *= (1 + abs(volume_trend) * 0.2)
-    else:
-        confidence *= 0.8  # 成交量不确认时降低置信度
-    
-    # 2. 价格-成交量协同性确认
-    if price_volume_sync > 0:
-        confidence *= (1 + price_volume_sync * 0.2)
-    else:
-        confidence *= (1 - abs(price_volume_sync) * 0.2)
-    
-    # 3. 成交量RSI确认
-    if signal == "bullish" and volume_rsi > 50:
-        confidence *= (1 + (volume_rsi - 50) / 250)  # 最多增加20%
-    elif signal == "bearish" and volume_rsi < 50:
-        confidence *= (1 + (50 - volume_rsi) / 250)
-    else:
-        confidence *= 0.9
-    
-    # 确保置信度在0到1之间
-    return max(min(confidence, 1.0), 0.0)
-
-
-def calculate_mean_reversion_signals(prices_df):
-    """
-    Mean reversion strategy using statistical measures and Bollinger Bands
-    """
-    # Calculate z-score of price relative to moving average
-    ma_50 = prices_df["close"].rolling(window=50).mean()
-    std_50 = prices_df["close"].rolling(window=50).std()
-    z_score = (prices_df["close"] - ma_50) / std_50
-
-    # Calculate Bollinger Bands
-    bb_upper, bb_lower = calculate_bollinger_bands(prices_df)
-
-    # Calculate RSI with multiple timeframes
-    rsi_14 = calculate_rsi(prices_df, 14)
-    rsi_28 = calculate_rsi(prices_df, 28)
-
-    # Mean reversion signals
-    price_vs_bb = (prices_df["close"].iloc[-1] - bb_lower.iloc[-1]) / (bb_upper.iloc[-1] - bb_lower.iloc[-1])
-
-    # Combine signals
-    if z_score.iloc[-1] < -2 and price_vs_bb < 0.2:
-        signal = "bullish"
-        confidence = min(abs(z_score.iloc[-1]) / 4, 1.0)
-    elif z_score.iloc[-1] > 2 and price_vs_bb > 0.8:
-        signal = "bearish"
-        confidence = min(abs(z_score.iloc[-1]) / 4, 1.0)
-    else:
-        signal = "neutral"
-        confidence = 0.5
-
-    return {
-        "signal": signal,
-        "confidence": confidence,
-        "metrics": {
-            "z_score": float(z_score.iloc[-1]),
-            "price_vs_bb": float(price_vs_bb),
-            "rsi_14": float(rsi_14.iloc[-1]),
-            "rsi_28": float(rsi_28.iloc[-1]),
-        },
-    }
-
-
-def calculate_momentum_signals(prices_df):
-    """
-    改进的多时间框架动量策略
-    """
-    # 检查数据质量
-    quality = check_data_quality(prices_df)
-    if not quality["is_valid"]:
-        return {
-            "signal": "neutral",
-            "confidence": 0.5,
-            "metrics": {"warning": quality["warning"]},
-            "data_quality": quality
-        }
-    
-    # 计算收益率
-    returns = prices_df["close"].pct_change()
-    metrics = {}
-    
-    # 根据可用窗口计算动量
-    if "short_term" in quality["available_windows"]:
-        metrics["momentum_1m"] = float(returns.rolling(WINDOW_CONFIG["windows"]["short_term"]).sum().iloc[-1])
-        
-    if "medium_term" in quality["available_windows"]:
-        metrics["momentum_3m"] = float(returns.rolling(WINDOW_CONFIG["windows"]["medium_term"]).sum().iloc[-1])
-        
-    if "long_term" in quality["available_windows"]:
-        metrics["momentum_6m"] = float(returns.rolling(WINDOW_CONFIG["windows"]["long_term"]).sum().iloc[-1])
-    
-    # 计算成交量动量（使用最短可用窗口）
-    volume_ma = prices_df["volume"].rolling(WINDOW_CONFIG["windows"]["short_term"]).mean()
-    metrics["volume_momentum"] = float(prices_df["volume"].iloc[-1] / volume_ma.iloc[-1])
-    
-    # 根据可用指标动态计算信号
-    signal, confidence = calculate_momentum_signal(metrics)
-    
-    return {
-        "signal": signal,
-        "confidence": confidence,
-        "metrics": metrics,
-        "data_quality": quality
-    }
-
-def calculate_momentum_signal(metrics: Dict[str, float]) -> Tuple[str, float]:
-    """
-    根据可用的动量指标计算综合信号
-    """
-    # 初始化权重
-    weights = {
-        "momentum_1m": 0.4,
-        "momentum_3m": 0.3,
-        "momentum_6m": 0.3
-    }
-    
-    # 调整权重基于可用指标
-    available_weights = {k: v for k, v in weights.items() if k in metrics}
-    if available_weights:
-        # 重新归一化权重
-        weight_sum = sum(available_weights.values())
-        available_weights = {k: v/weight_sum for k, v in available_weights.items()}
-    
-    # 计算加权动量得分
-    momentum_score = 0
-    for indicator, weight in available_weights.items():
-        momentum_score += metrics[indicator] * weight
-    
-    # 加入成交量确认
-    volume_confirmation = metrics.get("volume_momentum", 1.0) > 1.0
-    
-    # 生成信号
-    if momentum_score > 0.05 and volume_confirmation:
-        signal = "bullish"
-        confidence = min(abs(momentum_score) * 5, 1.0)
-    elif momentum_score < -0.05 and volume_confirmation:
-        signal = "bearish"
-        confidence = min(abs(momentum_score) * 5, 1.0)
-    else:
-        signal = "neutral"
-        confidence = 0.5
-    
-    return signal, confidence
+    return analyze_trend(prices_df)
 
 
 def calculate_volatility_signals(prices_df):
@@ -870,25 +592,6 @@ def normalize_pandas(obj):
     return obj
 
 
-def calculate_rsi(prices_df: pd.DataFrame, period: int = 14) -> pd.Series:
-    delta = prices_df["close"].diff()
-    gain = (delta.where(delta > 0, 0)).fillna(0)
-    loss = (-delta.where(delta < 0, 0)).fillna(0)
-    avg_gain = gain.rolling(window=period).mean()
-    avg_loss = loss.rolling(window=period).mean()
-    rs = avg_gain / avg_loss
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
-
-
-def calculate_bollinger_bands(prices_df: pd.DataFrame, window: int = 20) -> tuple[pd.Series, pd.Series]:
-    sma = prices_df["close"].rolling(window).mean()
-    std_dev = prices_df["close"].rolling(window).std()
-    upper_band = sma + (std_dev * 2)
-    lower_band = sma - (std_dev * 2)
-    return upper_band, lower_band
-
-
 def calculate_ema(df: pd.DataFrame, window: int) -> pd.Series:
     """
     Calculate Exponential Moving Average
@@ -982,3 +685,220 @@ def calculate_hurst_exponent(price_series: pd.Series, max_lag: int = 20) -> floa
     except (ValueError, RuntimeWarning):
         # Return 0.5 (random walk) if calculation fails
         return 0.5
+
+def calculate_support_resistance(df: pd.DataFrame, window: int = 20) -> Dict[str, float]:
+    """
+    使用局部最高/最低点识别支撑位和阻力位
+    """
+    # 获取窗口内的高低点
+    highs = df["high"].rolling(window=window, center=True).max()
+    lows = df["low"].rolling(window=window, center=True).min()
+    
+    # 识别关键价格水平
+    recent_highs = highs.tail(window)
+    recent_lows = lows.tail(window)
+    
+    # 使用KDE识别价格密集区
+    from scipy.stats import gaussian_kde
+    
+    # 计算支撑位
+    kde_lows = gaussian_kde(recent_lows.dropna())
+    support_candidates = np.linspace(recent_lows.min(), recent_lows.max(), 50)
+    support = support_candidates[np.argmax(kde_lows(support_candidates))]
+    
+    # 计算阻力位
+    kde_highs = gaussian_kde(recent_highs.dropna())
+    resistance_candidates = np.linspace(recent_highs.min(), recent_highs.max(), 50)
+    resistance = resistance_candidates[np.argmax(kde_highs(resistance_candidates))]
+    
+    return {
+        "support": support,
+        "resistance": resistance
+    }
+
+def calculate_price_position(current_price: float, support: float, resistance: float) -> float:
+    """
+    计算当前价格在支撑/阻力区间的相对位置
+    返回值在0-1之间，0表示在支撑位，1表示在阻力位
+    """
+    if resistance == support:
+        return 0.5
+    return (current_price - support) / (resistance - support)
+
+def calculate_trend_lines(df: pd.DataFrame, window: int = 20) -> Dict[str, Any]:
+    """
+    计算趋势线
+    返回上升和下降趋势线的参数
+    """
+    # 获取窗口数据
+    recent_data = df.tail(window)
+    
+    # 计算上升趋势线
+    highs = recent_data["high"].values
+    x_highs = np.arange(len(highs))
+    up_trend = np.polyfit(x_highs, highs, 1)
+    
+    # 计算下降趋势线
+    lows = recent_data["low"].values
+    x_lows = np.arange(len(lows))
+    down_trend = np.polyfit(x_lows, lows, 1)
+    
+    return {
+        "up_trend": up_trend,
+        "down_trend": down_trend
+    }
+
+def analyze_trend_lines(current_price: float, trend_lines: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    分析价格相对于趋势线的位置
+    """
+    # 计算当前趋势线值
+    x_current = len(trend_lines["up_trend"]) - 1
+    up_trend_value = np.polyval(trend_lines["up_trend"], x_current)
+    down_trend_value = np.polyval(trend_lines["down_trend"], x_current)
+    
+    # 计算价格相对于趋势线的位置
+    up_trend_diff = current_price - up_trend_value
+    down_trend_diff = current_price - down_trend_value
+    
+    # 计算趋势强度得分
+    score = 0
+    if up_trend_diff > 0 and down_trend_diff > 0:
+        score = 1  # 强势上涨
+    elif up_trend_diff < 0 and down_trend_diff < 0:
+        score = -1  # 强势下跌
+    else:
+        # 在趋势线之间，根据相对位置计算得分
+        score = (up_trend_diff + down_trend_diff) / (up_trend_value - down_trend_value)
+    
+    return {
+        "score": score,
+        "up_trend_diff": up_trend_diff,
+        "down_trend_diff": down_trend_diff
+    }
+
+def calculate_volume_support(df: pd.DataFrame, window: int = 20) -> float:
+    """
+    计算成交量支撑度
+    分析价格变动时的成交量确认程度
+    """
+    recent_data = df.tail(window)
+    
+    # 计算价格变动和对应的成交量
+    price_changes = recent_data["close"].pct_change()
+    volume_changes = recent_data["volume"].pct_change()
+    
+    # 计算价格上涨时的成交量支撑
+    up_days = price_changes > 0
+    up_volume_support = (volume_changes[up_days] > 0).mean()
+    
+    # 计算价格下跌时的成交量确认
+    down_days = price_changes < 0
+    down_volume_confirm = (volume_changes[down_days] > 0).mean()
+    
+    # 综合得分
+    return up_volume_support - down_volume_confirm
+
+def analyze_breakout(
+    df: pd.DataFrame,
+    support_resistance: Dict[str, float],
+    volume_support: float
+) -> Dict[str, Any]:
+    """
+    分析价格突破
+    考虑支撑/阻力位突破的有效性
+    """
+    current_price = df["close"].iloc[-1]
+    current_volume = df["volume"].iloc[-1]
+    avg_volume = df["volume"].tail(20).mean()
+    
+    # 计算突破强度
+    if current_price > support_resistance["resistance"]:
+        breakout_type = "up"
+        strength = (current_price - support_resistance["resistance"]) / support_resistance["resistance"]
+    elif current_price < support_resistance["support"]:
+        breakout_type = "down"
+        strength = (support_resistance["support"] - current_price) / support_resistance["support"]
+    else:
+        breakout_type = "none"
+        strength = 0
+    
+    # 成交量确认
+    volume_confirm = current_volume > avg_volume * 1.5
+    
+    return {
+        "type": breakout_type,
+        "strength": strength,
+        "volume_confirmed": volume_confirm
+    }
+
+def combine_trend_signals(
+    short_trend: bool,
+    medium_trend: bool,
+    price_position: float,
+    trend_line_signal: Dict[str, Any],
+    volume_trend: float,
+    price_volume_sync: float,
+    breakout_signal: Dict[str, Any],
+    trend_strength: float
+) -> Tuple[str, float]:
+    """
+    综合各种趋势信号
+    使用加权方法计算最终信号
+    """
+    # 初始化信号强度
+    bullish_strength = 0
+    bearish_strength = 0
+    
+    # 1. 趋势信号权重
+    trend_weight = 0.3
+    if short_trend and medium_trend:
+        bullish_strength += trend_weight
+    elif not short_trend and not medium_trend:
+        bearish_strength += trend_weight
+    
+    # 2. 支撑/阻力位权重
+    sr_weight = 0.2
+    if price_position < 0.3:  # 接近支撑位
+        bullish_strength += sr_weight * (1 - price_position)
+    elif price_position > 0.7:  # 接近阻力位
+        bearish_strength += sr_weight * price_position
+    
+    # 3. 趋势线权重
+    trendline_weight = 0.15
+    trendline_score = trend_line_signal["score"]
+    if trendline_score > 0:
+        bullish_strength += trendline_weight * trendline_score
+    else:
+        bearish_strength += trendline_weight * abs(trendline_score)
+    
+    # 4. 成交量权重
+    volume_weight = 0.2
+    if volume_trend > 0 and price_volume_sync > 0:
+        bullish_strength += volume_weight * min(volume_trend, price_volume_sync)
+    elif volume_trend < 0 and price_volume_sync < 0:
+        bearish_strength += volume_weight * min(abs(volume_trend), abs(price_volume_sync))
+    
+    # 5. 突破权重
+    breakout_weight = 0.15
+    if breakout_signal["type"] == "up" and breakout_signal["volume_confirmed"]:
+        bullish_strength += breakout_weight * breakout_signal["strength"]
+    elif breakout_signal["type"] == "down" and breakout_signal["volume_confirmed"]:
+        bearish_strength += breakout_weight * breakout_signal["strength"]
+    
+    # 计算最终信号
+    net_strength = bullish_strength - bearish_strength
+    
+    # 根据趋势强度调整置信度
+    confidence = abs(net_strength) * trend_strength
+    
+    # 确定信号方向
+    if net_strength > 0.1:
+        signal = "bullish"
+    elif net_strength < -0.1:
+        signal = "bearish"
+    else:
+        signal = "neutral"
+        confidence = 0.5
+    
+    return signal, min(confidence, 1.0)

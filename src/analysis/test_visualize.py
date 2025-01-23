@@ -37,6 +37,20 @@ def parse_args():
     parser.add_argument('--window', type=int, default=200,
                       help='显示窗口大小 (默认: 200天)')
     
+    # 添加信号显示控制参数
+    parser.add_argument('--trend', action='store_true', default=False,
+                      help='显示趋势信号')
+    parser.add_argument('--mean-reversion', action='store_true', default=False,
+                      help='显示均值回归信号')
+    parser.add_argument('--momentum', action='store_true', default=True,
+                      help='显示动量信号')
+    parser.add_argument('--volatility', action='store_true', default=False,
+                      help='显示波动率信号')
+    parser.add_argument('--all-signals', action='store_true', default=False,
+                      help='显示所有信号')
+    parser.add_argument('--combined', action='store_true', default=False,
+                      help='显示综合信号')
+    
     return parser.parse_args()
 
 def main():
@@ -48,6 +62,12 @@ def main():
     print(f"股票代码: {args.symbol}")
     print(f"时间范围: {args.start} 至 {args.end}")
     print(f"显示窗口: {args.window}天")
+    print("信号显示设置:")
+    print(f"- 趋势信号: {'是' if args.trend or args.all_signals else '否'}")
+    print(f"- 均值回归信号: {'是' if args.mean_reversion or args.all_signals else '否'}")
+    print(f"- 动量信号: {'是' if args.momentum or args.all_signals else '否'}")
+    print(f"- 波动率信号: {'是' if args.volatility or args.all_signals else '否'}")
+    print(f"- 综合信号: {'是' if args.combined or args.all_signals else '否'}")
     print("========================\n")
     
     try:
@@ -69,7 +89,15 @@ def main():
         print(f"数据范围: {prices_df.index.min()} 至 {prices_df.index.max()}\n")
         
         # 显示可视化分析
-        visualize_trend_signals(prices_df, window_size=args.window)
+        visualize_trend_signals(
+            prices_df, 
+            window_size=args.window,
+            show_trend=args.trend or args.all_signals,
+            show_mean_reversion=args.mean_reversion or args.all_signals,
+            show_momentum=args.momentum or args.all_signals,
+            show_volatility=args.volatility or args.all_signals,
+            show_combined=args.combined or args.all_signals
+        )
         
     except Exception as e:
         print(f"错误: {str(e)}")
